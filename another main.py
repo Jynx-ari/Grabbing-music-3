@@ -24,8 +24,10 @@ class MusicPlayer:
     def __init__(self):
         self.queue = deque()
         self.current_song = None
+        self.next_song = None # Preloaded song
         self.state = "STOPPED" # PLAYING, PAUSED, STOPPED
         self.ffmpeg_process = None
+        self.next_ffmpeg_process = None # Preloaded process
         self.device = None
         self.lock = threading.Lock()
         self.song_finished = False 
@@ -51,12 +53,45 @@ class MusicPlayer:
             except Exception as e:
                 print(f"❌ Error fetching: {e}")
 
+    def preload_next(self):
+        """Pre-spawns the FFmpeg process for the next song in the queue."""
+        if self.next_ffmpeg_process is not None:
+            return
+
+        if not self.queue:
+            return
+
+        song = self.queue.popleft()
+        self.next_song = song
+        
+        url = song['url']
+        ffmpeg_cmd = [
+            'ffmpeg',
+            '-reconnect', '1',
+            '-reconnect_at_eof', '1',
+            '-reconnect_streamed', '1',
+            '-reconnect_delay_max', '5',
+            '-i', url,
+            '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2', '-'
+        ]
+        
+        try:
+            self.next_ffmpeg_process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
+            )
+        except Exception as e:
+            print(f"❌ Preload Error: {e}")
+            self.next_song = None
+
     def shuffle(self):
         with self.lock:
+            # Only shuffle the remaining queue; the preloaded song stays as 'next'
             items = list(self.queue)
             random.shuffle(items)
             self.queue = deque(items)
-            print("🔀 Queue shuffled.")
+            print("🔀 Queue shuffled (Next song preserved).")
 
     def toggle_pause(self):
         with self.lock:
@@ -70,42 +105,57 @@ class MusicPlayer:
     def stop(self):
         with self.lock:
             self.state = "STOPPED"
+            if self.ffmpeg_process:
+                self.ffmpeg_process.terminate()
+            if self.next_ffmpeg_process:
+                self.next_ffmpeg_process.terminate()
+                self.next_ffmpeg_process = None
+                self.next_song = None
             print("⏹️ Stopped")
 
     def play_next(self, silent=False):
         with self.lock:
-            self.song_finished = False # <--- Reset the flag for the new song
+            self.song_finished = False 
             if self.ffmpeg_process:
                 self.ffmpeg_process.terminate()
                 self.ffmpeg_process.wait()
             
-            if not self.queue:
+            # Use preloaded song if available
+            if self.next_ffmpeg_process:
+                self.ffmpeg_process = self.next_ffmpeg_process
+                self.current_song = self.next_song
+                self.next_ffmpeg_process = None
+                self.next_song = None
+            elif self.queue:
+                # Fallback: Pop from queue and spawn immediately
+                self.current_song = self.queue.popleft()
+                url = self.current_song['url']
+                ffmpeg_cmd = [
+                    'ffmpeg',
+                    '-reconnect', '1',
+                    '-reconnect_at_eof', '1',
+                    '-reconnect_streamed', '1',
+                    '-reconnect_delay_max', '5',
+                    '-i', url,
+                    '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2', '-'
+                ]
+                self.ffmpeg_process = subprocess.Popen(
+                    ffmpeg_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL
+                )
+            else:
                 if not silent:
                     print("📭 Queue is empty!")
                 self.state = "STOPPED"
                 self.current_song = None
                 return
 
-            self.current_song = self.queue.popleft()
             self.state = "PLAYING"
-            
-            url = self.current_song['url']
-            ffmpeg_cmd = [
-                'ffmpeg',
-                '-reconnect', '1',
-                '-reconnect_at_eof', '1',
-                '-reconnect_streamed', '1',
-                '-reconnect_delay_max', '5',
-                '-i', url,
-                '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2', '-'
-            ]
-            
-            self.ffmpeg_process = subprocess.Popen(
-                ffmpeg_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL
-            )
             print(f"🎶 Now playing: {self.current_song['title']}")
+            
+            # Trigger preload for the NEXT next song
+            self.preload_next()
 
 def master_generator(player, channels=2, sample_width=2):
     # Initial priming for miniaudio
